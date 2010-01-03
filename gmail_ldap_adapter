@@ -1,0 +1,96 @@
+#!/usr/bin/ruby -W0
+
+require 'rubygems'
+require 'ldap/server'
+require 'net/https'
+require 'rexml/document'
+
+class HashOperation < LDAP::Server::Operation
+  def initialize(connection, messageID, hash)
+    super(connection, messageID)
+    @hash = hash
+  end
+  def search(basedn, scope, deref, filter)
+    basedn.downcase!
+    case scope
+    when LDAP::Server::BaseObject
+      obj = @hash[basedn]
+      raise LDAP::ResultError::NoSuchObject unless obj
+      send_SearchResultEntry(basedn, obj) if LDAP::Server::Filter.run(filter, obj)
+    when LDAP::Server::WholeSubtree
+      @hash.each do |dn, av|
+        next unless dn.index(basedn, -basedn.length)    # under basedn?
+        next unless LDAP::Server::Filter.run(filter, av)  # attribute filter?
+        send_SearchResultEntry(dn, av)
+      end
+    else
+      raise LDAP::ResultError::UnwillingToPerform, "OneLevel not implemented"
+    end
+  end
+end
+
+def google_authenticate(email, password)
+  http = Net::HTTP.new('www.google.com', 443)
+  http.use_ssl = true
+  path = '/accounts/ClientLogin'
+  data = "accountType=HOSTED_OR_GOOGLE&Email=#{email}" +
+    "&Passwd=#{password}" +
+    "&service=cp" +
+    "&source=chneeb-gmailLdapAdapter-1"
+  headers = {'Content-Type' => 'application/x-www-form-urlencoded'}
+  resp, data = http.post(path, data, headers)
+  cl_string = data[/Auth=(.*)/, 1]
+end
+
+def fetch_gmail_contacts(cl_string, results=100)
+  http = Net::HTTP.new('www.google.com', 80)
+  http.use_ssl = false
+  path = "/m8/feeds/contacts/default/base?max-results=#{results}"
+  headers = {"Authorization" => "GoogleLogin auth=#{cl_string}"}
+  resp, data = http.get(path, headers)
+  data
+end
+
+def gdata_to_ldap_directory(data)
+  directory = {"dc=example,dc=com" => {"cn" => ["Top object"]}}
+  xml = REXML::Document.new(data)
+  xml.elements.each("//entry") do |entry|
+    cn = entry.elements['title'].text
+    if gd_email = entry.elements['gd:email']
+      mail = gd_email.attributes['address']
+    end
+    directory["cn=#{cn},dc=example,dc=com"] = {
+      "cn" => cn,
+      "sn" => cn.split[-1],
+      "fn" => cn.split[0],
+      "mail" => mail
+    } unless cn.nil?
+  end
+  directory
+end
+
+def keychain_access(server)
+  security_result = %x{security find-internet-password -gs #{server} 2>&1}
+  password_line, account_line = security_result.split(/\n/).values_at(0,6)
+  account = account_line.match(/^\s+"acct"<blob>="(.*)"/).captures.first
+  password = password_line.match(/^password: "(.*)"$/).captures.first
+  return account, password
+end
+
+email, password = keychain_access("www.google.com")
+
+cl_string = google_authenticate(email, password)
+data = fetch_gmail_contacts(cl_string, 1000)
+directory = gdata_to_ldap_directory(data)
+
+puts "#{directory.keys.size} Gmail contacts retrieved"
+
+s = LDAP::Server.new(
+  :port     => 1389,
+  :nodelay    => true,
+  :listen     => 10,
+  :operation_class  => HashOperation,
+  :operation_args   => [directory]
+)
+s.run_tcpserver
+s.join
